@@ -3,6 +3,7 @@ default.profraw
 Package.resolved
 .build
 /.*-build
+/.cmake-smoke-test
 /Packages
 /*.xcodeproj
 /*.sublime-project
