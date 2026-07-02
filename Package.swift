@@ -170,17 +170,6 @@ var targets: [Target] = [
     ],
     swiftSettings: globalSwiftSettings
   ),
-
-  // MARK: Command plugins
-  .plugin(
-    name: "cmake-smoke-test",
-    capability: .command(
-      intent: .custom(
-        verb: "cmake-smoke-test",
-        description: "Build Swift Build using CMake for validation purposes"
-      )
-    )
-  ),
 ]
 
 if buildOnlyTests {
