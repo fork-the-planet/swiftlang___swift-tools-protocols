@@ -16,8 +16,16 @@ public import LanguageServerProtocol
 import Synchronization
 @_spi(SourceKitLSP) import ToolsProtocolsSwiftExtensions
 
-#if canImport(Android)
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Android)
 import Android
+#elseif canImport(WinSDK)
+import WinSDK
 #endif
 
 #if canImport(CDispatch)
@@ -187,13 +195,11 @@ public final class JSONRPCConnection: Connection {
       Logger(subsystem: LoggingScope.subsystem, category: stderrLoggingCategory).info("\($0)")
     }
     let stderrHandler = Pipe()
-    stderrHandler.fileHandleForReading.readabilityHandler = { fileHandle in
-      let newData = fileHandle.availableData
-      if newData.count == 0 {
-        stderrHandler.fileHandleForReading.readabilityHandler = nil
-      } else {
-        logForwarder.handleDataFromPipe(newData)
-      }
+    Self.readInBackground(
+      fileHandle: stderrHandler.fileHandleForReading,
+      queueLabel: "\(name)-stderr-read-queue"
+    ) { data in
+      logForwarder.handleDataFromPipe(data)
     }
     process.standardError = stderrHandler
     process.terminationHandler = { process in
@@ -221,6 +227,73 @@ public final class JSONRPCConnection: Connection {
     return (connection, process)
   }
   #endif  // os(macOS) || !canImport(Darwin)
+
+  /// Read from `fileHandle` on a dedicated background queue with a blocking loop, forwarding each chunk to
+  /// `receiveData` until end-of-file, then invoke `reachedEndOfFile`.
+  ///
+  /// A blocking read is used rather than a `readabilityHandler`. `readabilityHandler` installs a libdispatch
+  /// read source on the file descriptor; tearing that source down races epoll event delivery on Linux and
+  /// can crash the process in `_dispatch_event_loop_drain`. A blocking read never registers the descriptor
+  /// with libdispatch. See https://github.com/swiftlang/swift-corelibs-libdispatch/issues/949.
+  ///
+  /// The raw file descriptor is read instead of `FileHandle.read(upToCount:)`: on non-Darwin platforms the
+  /// latter blocks until it accumulates the full requested count or reaches EOF, which would withhold small,
+  /// intermittently emitted output until the writer closes the pipe. A raw `read` returns as soon as any
+  /// bytes are available. On Windows the file descriptor is unavailable and the crash does not occur, so a
+  /// `readabilityHandler` read source is used there.
+  ///
+  /// A read failure other than `EINTR` is logged and ends the loop.
+  @_spi(Testing)
+  public static func readInBackground(
+    fileHandle: FileHandle,
+    queueLabel: String,
+    receiveData: @Sendable @escaping (Data) -> Void,
+    reachedEndOfFile: (@Sendable () -> Void)? = nil
+  ) {
+    #if os(Windows)
+    // `FileHandle.fileDescriptor` is unavailable on Windows. The libdispatch epoll crash has not occurred
+    // on Windows, so a `readabilityHandler` read source is used there.
+    fileHandle.readabilityHandler = { handle in
+      let data = handle.availableData
+      if data.isEmpty {
+        handle.readabilityHandler = nil
+        reachedEndOfFile?()
+      } else {
+        receiveData(data)
+      }
+    }
+    #else
+    let fileDescriptor = fileHandle.fileDescriptor
+    let queue = DispatchQueue(label: queueLabel)
+    queue.async {
+      var buffer = [UInt8](repeating: 0, count: 8 * 1024)
+      while true {
+        let (bytesRead, readErrno) = buffer.withUnsafeMutableBytes { ptr -> (Int, CInt) in
+          let count = read(fileDescriptor, ptr.baseAddress, ptr.count)
+          return (count, errno)
+        }
+        if bytesRead > 0 {
+          receiveData(Data(buffer[0..<bytesRead]))
+        } else if bytesRead == 0 {
+          // End-of-file: the writer closed the pipe.
+          break
+        } else if readErrno == EINTR {
+          // Interrupted by a signal; retry the read.
+          continue
+        } else {
+          logger.error(
+            "Reading \(queueLabel, privacy: .public) failed: \(String(cString: strerror(readErrno)), privacy: .public) (errno \(readErrno))"
+          )
+          break
+        }
+      }
+      // Keep the handle alive for the duration of the loop so its file descriptor is not closed while
+      // `read` is blocked on it.
+      withExtendedLifetime(fileHandle) {}
+      reachedEndOfFile?()
+    }
+    #endif
+  }
 
   deinit {
     assert(state == .closed)
